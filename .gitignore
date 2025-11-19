@@ -1,2 +1,5 @@
 mvp-sept/
 .DS_Store
+data/
+cleaned_data/
+results/
