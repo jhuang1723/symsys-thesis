@@ -60,7 +60,7 @@ def iter_category_doc_urls(category_url: str, items_per_page: int, max_pages: in
         main = soup.find("main") or soup
         for a in main.select('a[href^="/documents/"]'):
             href = a.get("href")
-            if not href: 
+            if not href:
                 continue
             # Ensure it's a document page, not anchors or query-only links
             if href.startswith("/documents/"):
@@ -181,6 +181,11 @@ def main():
                     help="Skip pages with no transcript text.")
     ap.add_argument("--min-words", type=int, default=30,
                     help="When --require-transcript, also skip if transcript shorter than this.")
+    # NEW: year-range filter; defaults 1932–2024
+    ap.add_argument("--start-year", type=int, default=1932,
+                    help="Earliest year (inclusive) to keep (default: 1932).")
+    ap.add_argument("--end-year", type=int, default=2024,
+                    help="Latest year (inclusive) to keep (default: 2024).")
     args = ap.parse_args()
 
     cat_url = build_category_url(args.slug)
@@ -199,11 +204,30 @@ def main():
                 continue
             try:
                 rec = parse_document(doc_url)
+
+                # --- YEAR FILTER: only keep docs in [start_year, end_year] ---
+                year = None
+                if rec.get("date_iso"):
+                    try:
+                        year = int(rec["date_iso"][:4])
+                    except Exception:
+                        year = None
+
+                # Skip if no valid year OR outside desired range
+                if year is None or year < args.start_year or year > args.end_year:
+                    seen.add(doc_url)
+                    if i % 10 == 0:
+                        seen_path.write_text("\n".join(sorted(seen)))
+                    time.sleep(0.25)
+                    continue
+                # -------------------------------------------------------------
+
                 if args.require_transcript:
                     if not rec["transcript"] or (rec["word_count"] or 0) < args.min_words:
                         # Skip video-only or empty pages
                         seen.add(doc_url)
-                        if i % 10 == 0: seen_path.write_text("\n".join(sorted(seen)))
+                        if i % 10 == 0:
+                            seen_path.write_text("\n".join(sorted(seen)))
                         time.sleep(0.25)
                         continue
                 rows.append(rec)
@@ -219,10 +243,21 @@ def main():
         seen_path.write_text("\n".join(sorted(seen)))
 
     if not rows:
-        print("No rows scraped (maybe --require-transcript filtered them all).")
+        print("No rows scraped (maybe filters removed them all).")
         return
 
     df = pd.DataFrame(rows)
+
+    # Safety: enforce year filter again at the dataframe level, just in case
+    if "date_iso" in df.columns:
+        df = df[df["date_iso"].notna()].copy()
+        years = df["date_iso"].str.slice(0, 4).astype(int)
+        df = df[(years >= args.start_year) & (years <= args.end_year)]
+
+    if df.empty:
+        print("No rows remaining after year filtering.")
+        return
+
     df.sort_values(["date_iso", "president", "title"], inplace=True, na_position="last")
 
     csv_path = args.out_dir / "rows.csv"

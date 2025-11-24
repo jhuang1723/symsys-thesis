@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
 # verse_match_pipeline_app.py
-# End-to-end pipeline for APP data (cleaned_data/*).
-#
-# Steps:
-#   1) Index Bible
-#      python scripts/verse_match_pipeline_app.py index-bible \
-#         --bible_in cleaned_data/bible_kjv_clean.csv --out_dir results/ --translation KJV
-#
-#   2) Index speeches + make windows
-#      python scripts/verse_match_pipeline_app.py index-speeches \
-#         --speeches_in cleaned_data/app/eulogies/rows_norm.parquet \
-#         --out_dir results/app/eulogies --window_len 30 --stride 5
-#
-#   3) Generate TF-IDF candidates (TOP-K = 10 by default)
-#      python scripts/verse_match_pipeline_app.py gen-candidates \
-#         --bible_index results/verses_index.parquet \
-#         --windows results/app/eulogies/windows.parquet \
-#         --out_dir results/app/eulogies --ngram_min 3 --ngram_max 5 --topk 10
-#
-#   4) Merge windows → spans, add alignment features, filter, export
-#      python scripts/verse_match_pipeline_app.py merge-spans \
-#         --out_dir results/app/eulogies --ngram_min 3 --ngram_max 5 \
-#         --bible_index results/verses_index.parquet \
-#         --min_cov 0.55 --min_lcs 0.45 --max_gap 8 --top_per_doc 10
-#
-# Outputs (per --out_dir):
-#   verses_index.parquet, speeches_index.parquet, windows.parquet,
-#   candidates.parquet, matches.parquet, matches_preview.csv
+"""
+End-to-end pipeline for APP data (cleaned_data/*).
+
+Steps:
+  1) Index Bible
+     python scripts/verse_match_pipeline_app.py index-bible \
+        --bible_in cleaned_data/bible_kjv_clean.csv --out_dir results/ --translation KJV
+
+  2) Index speeches + make windows
+     python scripts/verse_match_pipeline_app.py index-speeches \
+        --speeches_in cleaned_data/app/eulogies/rows_norm.parquet \
+        --out_dir results/app/eulogies --window_len 30 --stride 5
+
+  3) Generate TF-IDF candidates (TOP-K = 10 by default)
+     python scripts/verse_match_pipeline_app.py gen-candidates \
+        --bible_index results/verses_index.parquet \
+        --windows results/app/eulogies/windows.parquet \
+        --out_dir results/app/eulogies --ngram_min 3 --ngram_max 5 --topk 10
+
+  4) Merge windows → spans, add alignment features, filter, export AND
+  5) Score merged spans with classifier, output final scored+sorted matches
+
+    python3 scripts/verse_match_pipeline_app.py merge-spans \
+        --out_dir results/app/eulogies \
+        --ngram_min 3 --ngram_max 5 \
+        --min_cov 0.60 --min_lcs 0.55 --max_gap 8 --top_per_doc 10 \
+        --bible_index results/verses_index.parquet \
+        --model_path models/apb_lgbm_sem.pkl \
+        --threshold 0.01
+
+Outputs (per --out_dir):
+  verses_index.parquet, speeches_index.parquet, windows.parquet,
+  candidates.parquet, matches.parquet, matches_preview.csv
+"""
 
 import argparse
 import hashlib
@@ -450,14 +457,92 @@ def cmd_merge_spans(args):
     keep_top = keep[keep["rank_in_doc"] <= args.top_per_doc] \
         .sort_values(["doc_id","score_max"], ascending=[True, False])
 
-    write_table(keep, out_dir / "matches.parquet")
-    keep_top[[
-        "doc_id","title","president","date","ref","score_max",
-        "cov_ngram","lcs_ratio","start_token","end_token","snippet_norm","verse_text"
-    ]].to_csv(out_dir / "matches_preview.csv", index=False)
+    # If a model_path was provided, optionally score and write matches_scored.parquet
+    if getattr(args, "model_path", None):
+        try:
+            from bible_match_model import BibleMatchClassifier, normalize_text as bm_normalize
+        except Exception:
+            # fall back to local normalize_text if import fails
+            bm_normalize = normalize_text
+            BibleMatchClassifier = None
 
-    print(f"[ok] matches -> {out_dir/'matches.parquet'}  ({len(keep)} rows)")
-    print(f"[ok] preview -> {out_dir/'matches_preview.csv'}  ({len(keep_top)} rows)")
+        clf = None
+        if BibleMatchClassifier is not None:
+            print(f"[info] loading classifier from {args.model_path}")
+            clf = BibleMatchClassifier.load(args.model_path)
+
+        # prepare text and score
+        keep["snippet_norm"] = keep["snippet_norm"].astype(str).apply(bm_normalize)
+        keep["verse_norm"] = keep["verse_text"].astype(str).apply(bm_normalize)
+
+        if clf is None:
+            raise RuntimeError("Classifier unavailable: could not import BibleMatchClassifier from bible_match_model")
+
+        print("[info] applying classifier to merged spans...")
+        keep["match_proba"] = clf.predict_proba(keep["snippet_norm"], keep["verse_norm"])
+        keep["match_label"] = (keep["match_proba"] >= getattr(args, "threshold", 0.01)).astype(int)
+
+        df_sorted = keep.sort_values("match_proba", ascending=False)
+        out_file = out_dir / "matches_scored.parquet"
+        write_table(df_sorted, out_file)
+        print(f"[ok] wrote final scored matches -> {out_file}")
+
+        # optionally write the intermediate files as well
+        if getattr(args, "write_intermediate", False):
+            write_table(keep, out_dir / "matches.parquet")
+            keep_top[[
+                "doc_id","title","president","date","ref","score_max",
+                "cov_ngram","lcs_ratio","start_token","end_token","snippet_norm","verse_text"
+            ]].to_csv(out_dir / "matches_preview.csv", index=False)
+            print(f"[ok] matches -> {out_dir/'matches.parquet'}  ({len(keep)} rows)")
+            print(f"[ok] preview -> {out_dir/'matches_preview.csv'}  ({len(keep_top)} rows)")
+    else:
+        # default behavior: write matches and preview as before
+        write_table(keep, out_dir / "matches.parquet")
+        keep_top[[
+            "doc_id","title","president","date","ref","score_max",
+            "cov_ngram","lcs_ratio","start_token","end_token","snippet_norm","verse_text"
+        ]].to_csv(out_dir / "matches_preview.csv", index=False)
+
+        print(f"[ok] matches -> {out_dir/'matches.parquet'}  ({len(keep)} rows)")
+        print(f"[ok] preview -> {out_dir/'matches_preview.csv'}  ({len(keep_top)} rows)")
+
+
+# -------------------------
+# 5) Merge-spans + classifier scoring (final output)
+# -------------------------
+
+def cmd_score_and_merge(args):
+    from bible_match_model import BibleMatchClassifier, normalize_text
+    # joblib not required here; classifier provides load/save methods
+
+    out_dir = Path(args.out_dir)
+    matches_path  = out_dir / "matches.parquet"
+    if not matches_path.exists():
+        raise FileNotFoundError(f"[error] Expected merge-spans output at {matches_path}")
+
+    print(f"[info] loading classifier from {args.model_path}")
+    clf = BibleMatchClassifier.load(args.model_path)
+
+    print(f"[info] loading merged spans: {matches_path}")
+    df = _read_infer(matches_path)
+
+    # normalize text as required by classifier
+    df["snippet_norm"] = df["snippet_norm"].astype(str).apply(normalize_text)
+    df["verse_norm"]   = df["verse_text"].astype(str).apply(normalize_text)
+
+    print("[info] applying classifier...")
+    df["match_proba"] = clf.predict_proba(df["snippet_norm"], df["verse_norm"])
+    df["match_label"] = (df["match_proba"] >= args.threshold).astype(int)
+
+    print("[info] sorting by probability...")
+    df_sorted = df.sort_values("match_proba", ascending=False)
+
+    out_file = out_dir / "matches_scored.parquet"
+    write_table(df_sorted, out_file)
+
+    print(f"[ok] wrote final scored matches -> {out_file}")
+    print("[done] score-and-merge complete.")
 
 
 # -------------------------
@@ -503,7 +588,19 @@ def main():
     p4.add_argument("--min_lcs", type=float, default=0.45, help="min token-level LCS ratio to keep")
     p4.add_argument("--max_gap", type=int, default=8, help="max token gap when merging adjacent windows")
     p4.add_argument("--top_per_doc", type=int, default=10, help="how many merged hits to keep per doc for preview")
+    p4.add_argument("--model_path", help="Optional path to saved BibleMatchClassifier; if provided, score merged spans and write matches_scored.parquet")
+    p4.add_argument("--threshold", type=float, default=0.01, help="Decision threshold for match_label when scoring (default: 0.01)")
+    p4.add_argument("--write_intermediate", action="store_true", help="If set when --model_path is provided, also write matches.parquet and matches_preview.csv in addition to matches_scored.parquet")
     p4.set_defaults(func=cmd_merge_spans)
+
+    p5 = sub.add_parser("score-and-merge", help="Apply classifier to matches and write sorted scored file.")
+    p5.add_argument("--out_dir", required=True, help="Directory containing matches.parquet from merge-spans")
+    p5.add_argument("--model_path", default="models/apb_lgbm_sem.pkl",
+                    help="Path to saved BibleMatchClassifier (default: models/apb_lgbm_sem.pkl)")
+    p5.add_argument("--threshold", type=float, default=0.01,
+                    help="Decision threshold for match_label (default: 0.01)")
+    p5.set_defaults(func=cmd_score_and_merge)
+
 
     args = p.parse_args()
     args.func(args)
