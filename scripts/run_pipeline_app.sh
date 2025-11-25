@@ -16,9 +16,11 @@ Options:
   --model-path PATH        Path to saved BibleMatchClassifier (default: models/apb_lgbm_sem.pkl)
   --threshold FLOAT        Decision threshold for classifier (default: 0.01)
   --write-intermediate     If set, write matches.parquet and matches_preview.csv in addition to matches_scored.parquet
+  --write-scored           Persist matches_scored.parquet (default: off)
   --ngram-min N            ngram min for gen-candidates (default: 3)
   --ngram-max N            ngram max for gen-candidates (default: 5)
-  --top-per-doc N          how many merged hits to keep per doc for preview (default: 10)
+  --top-per-doc N          how many merged hits to keep per doc for preview (default: 15)
+  --tfidf-topk N           TF-IDF candidates to keep per window (default: 25)
   --help                   Show this message
 
 Example:
@@ -39,11 +41,13 @@ BIBLE_INDEX="results/verses_index.parquet"
 OUT_DIR="results/app/${CATEGORY}"
 SPEECHES_IN="cleaned_data/app/${CATEGORY}/rows_norm.parquet"
 MODEL_PATH="models/apb_lgbm_sem.pkl"
-THRESHOLD=0.01
+THRESHOLD=0.005
 NGRAM_MIN=3
 NGRAM_MAX=5
-TOP_PER_DOC=10
+TOP_PER_DOC=15
+CAND_TOPK=25
 WRITE_INTERMEDIATE=false
+WRITE_SCORED=false
 
 # parse optional args
 while [[ $# -gt 0 ]]; do
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
       THRESHOLD="$2"; shift 2;;
     --write-intermediate)
       WRITE_INTERMEDIATE=true; shift;;
+    --write-scored)
+      WRITE_SCORED=true; shift;;
     --require-transcript)
       REQUIRE_TRANSCRIPT=true; shift;;
     --items-per-page)
@@ -68,6 +74,8 @@ while [[ $# -gt 0 ]]; do
       NGRAM_MAX="$2"; shift 2;;
     --top-per-doc)
       TOP_PER_DOC="$2"; shift 2;;
+    --tfidf-topk)
+      CAND_TOPK="$2"; shift 2;;
     --help)
       usage;;
     *)
@@ -173,12 +181,12 @@ echo "[info] 3/4 Generating TF-IDF candidates -> $OUT_DIR/candidates.parquet"
 python3 scripts/verse_match_pipeline_app.py gen-candidates \
   --bible_index "$BIBLE_INDEX" \
   --windows "$OUT_DIR/windows.parquet" \
-  --out_dir "$OUT_DIR" --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --topk 10 --batch_size 1000
+  --out_dir "$OUT_DIR" --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --topk $CAND_TOPK --batch_size 1000
 
 # Merge spans and (optionally) score in one step
 echo "[info] 4/4 Merging spans and scoring -> matches_scored.parquet"
 CMD=(python3 scripts/verse_match_pipeline_app.py merge-spans --out_dir "$OUT_DIR" \
-  --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --min_cov 0.60 --min_lcs 0.55 --max_gap 8 --top_per_doc $TOP_PER_DOC \
+  --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --min_cov 0.45 --min_lcs 0.40 --max_gap 8 --top_per_doc $TOP_PER_DOC \
   --bible_index "$BIBLE_INDEX" \
   --model_path "$MODEL_PATH" --threshold $THRESHOLD)
 
@@ -186,10 +194,17 @@ if [ "$WRITE_INTERMEDIATE" = true ]; then
   CMD+=(--write_intermediate)
 fi
 
+if [ "$WRITE_SCORED" = true ]; then
+  CMD+=(--write_scored)
+fi
+
 # join and run
 echo "[debug] running: ${CMD[*]}"
 "${CMD[@]}"
 
-echo "[done] pipeline complete. Scored matches at: $OUT_DIR/matches_scored.parquet"
+echo "[done] pipeline complete. Positive matches at: $OUT_DIR/matches_positive.csv"
+if [ "$WRITE_SCORED" = true ]; then
+  echo "[info] Full scored matches at: $OUT_DIR/matches_scored.parquet"
+fi
 
 exit 0

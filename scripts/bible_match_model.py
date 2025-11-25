@@ -243,7 +243,7 @@ class BibleMatchClassifier:
 
     # ----- Public API -----
 
-    def fit(self, df_train: pd.DataFrame):
+    def fit(self, df_train: pd.DataFrame, sample_weights: np.ndarray | None = None):
         """
         df_train must have: snippet_norm, verse_norm, match (0/1)
         """
@@ -283,16 +283,28 @@ class BibleMatchClassifier:
             sem_cos, sem_diff_mean, sem_prod_mean,
         )
 
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=self.random_state,
-            stratify=y if len(np.unique(y)) > 1 else None,
-        )
+        strat = y if len(np.unique(y)) > 1 else None
+        if sample_weights is not None:
+            X_tr, X_val, y_tr, y_val, w_tr, w_val = train_test_split(
+                X,
+                y,
+                sample_weights,
+                test_size=0.2,
+                random_state=self.random_state,
+                stratify=strat,
+            )
+        else:
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X,
+                y,
+                test_size=0.2,
+                random_state=self.random_state,
+                stratify=strat,
+            )
+            w_tr = w_val = None
 
-        train_data = lgb.Dataset(X_tr, label=y_tr)
-        valid_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        train_data = lgb.Dataset(X_tr, label=y_tr, weight=w_tr)
+        valid_data = lgb.Dataset(X_val, label=y_val, weight=w_val, reference=train_data)
 
         params = {
             "objective": "binary",
@@ -316,14 +328,21 @@ class BibleMatchClassifier:
         )
 
         # Quick sanity metric at threshold 0.01
-        from sklearn.metrics import precision_score, recall_score, f1_score
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
+        y_tr_proba = self.model.predict(X_tr, num_iteration=self.model.best_iteration)
         y_val_proba = self.model.predict(X_val, num_iteration=self.model.best_iteration)
-        y_val_pred = (y_val_proba >= 0.01).astype(int)
-        prec = precision_score(y_val, y_val_pred)
-        rec = recall_score(y_val, y_val_pred)
-        f1 = f1_score(y_val, y_val_pred)
-        print(f"[Validation @ 0.01] precision={prec:.3f}, recall={rec:.3f}, f1={f1:.3f}")
+
+        def report(name, y_true, proba):
+            preds = (proba >= 0.5).astype(int)
+            acc = accuracy_score(y_true, preds)
+            prec = precision_score(y_true, preds, zero_division=0)
+            rec = recall_score(y_true, preds, zero_division=0)
+            f1 = f1_score(y_true, preds, zero_division=0)
+            print(f"[{name}] accuracy={acc:.3f} precision={prec:.3f} recall={rec:.3f} f1={f1:.3f}")
+
+        report("Train @0.50", y_tr, y_tr_proba)
+        report("Valid @0.50", y_val, y_val_proba)
 
     def predict_proba(self, snippets, verses):
         if self.model is None:

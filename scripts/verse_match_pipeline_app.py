@@ -428,6 +428,158 @@ def _add_text_and_features(spans: pd.DataFrame, docs: pd.DataFrame, vers: pd.Dat
     out = out.merge(docs_idx[["title","president","date","doc_norm"]].reset_index(), on="doc_id", how="left")
     return out
 
+
+_REF_RANGE_RE = re.compile(r"^(.+?)\s+(\d+):(\d+)$")
+
+
+def _parse_ref_parts(ref: str):
+    if not isinstance(ref, str):
+        return (None, None, None)
+    ref = ref.strip()
+    m = _REF_RANGE_RE.match(ref)
+    if not m:
+        return (None, None, None)
+    book = m.group(1).strip()
+    try:
+        chapter = int(m.group(2))
+        verse = int(m.group(3))
+    except ValueError:
+        return (None, None, None)
+    return (book, chapter, verse)
+
+
+def _format_ref_range(book: str, chapter: int, start_verse: int, end_verse: int) -> str:
+    if start_verse == end_verse:
+        return f"{book} {chapter}:{start_verse}"
+    return f"{book} {chapter}:{start_verse}-{end_verse}"
+
+
+def _finalize_pending_range(pending: dict) -> dict:
+    verse_range = _format_ref_range(
+        pending["book"],
+        pending["chapter"],
+        pending["start_verse"],
+        pending["end_verse"],
+    )
+    verse_text = " ".join([t for t in pending["verse_texts"] if isinstance(t, str) and t.strip()])
+    return {
+        "doc_id": pending["doc_id"],
+        "title": pending["title"],
+        "president": pending["president"],
+        "date": pending["date"],
+        "snippet_norm": pending["snippet_norm"],
+        "verse_range": verse_range,
+        "verse_text": verse_text or "",
+        "match_proba": pending["match_proba"],
+        "start_token": pending["start_token"],
+        "end_token": pending["end_token"],
+    }
+
+
+def _collapse_positive_matches(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "doc_id",
+        "title",
+        "president",
+        "date",
+        "snippet_norm",
+        "verse_range",
+        "verse_text",
+        "match_proba",
+        "start_token",
+        "end_token",
+    ]
+    if "match_label" not in df.columns or df.empty:
+        return pd.DataFrame(columns=cols)
+    pos = df[df["match_label"] == 1].copy()
+    if pos.empty:
+        return pd.DataFrame(columns=cols)
+
+    parsed = pos["ref"].apply(_parse_ref_parts)
+    pos["book"] = [p[0] for p in parsed]
+    pos["chapter"] = [p[1] for p in parsed]
+    pos["verse_num"] = [p[2] for p in parsed]
+
+    rows = []
+    group_keys = ["doc_id", "title", "president", "date", "snippet_norm"]
+    for key, grp in pos.groupby(group_keys, dropna=False):
+        grp = grp.sort_values(["book", "chapter", "verse_num", "start_token"], na_position="last")
+        pending = None
+        for r in grp.itertuples():
+            if pd.isna(r.book) or pd.isna(r.chapter) or pd.isna(r.verse_num):
+                rows.append({
+                    "doc_id": r.doc_id,
+                    "title": r.title,
+                    "president": r.president,
+                    "date": r.date,
+                    "snippet_norm": r.snippet_norm,
+                    "verse_range": r.ref,
+                    "verse_text": r.verse_text,
+                    "match_proba": r.match_proba,
+                    "start_token": r.start_token,
+                    "end_token": r.end_token,
+                })
+                continue
+            if pending is None:
+                pending = {
+                    "doc_id": r.doc_id,
+                    "title": r.title,
+                    "president": r.president,
+                    "date": r.date,
+                    "snippet_norm": r.snippet_norm,
+                    "book": r.book,
+                    "chapter": r.chapter,
+                    "start_verse": r.verse_num,
+                    "end_verse": r.verse_num,
+                    "verse_texts": [r.verse_text],
+                    "match_proba": r.match_proba,
+                    "start_token": r.start_token,
+                    "end_token": r.end_token,
+                }
+            elif (
+                r.book == pending["book"]
+                and r.chapter == pending["chapter"]
+                and r.verse_num == pending["end_verse"] + 1
+            ):
+                pending["end_verse"] = r.verse_num
+                pending["verse_texts"].append(r.verse_text)
+                pending["match_proba"] = max(pending["match_proba"], r.match_proba)
+                pending["end_token"] = max(pending["end_token"], r.end_token)
+            else:
+                rows.append(_finalize_pending_range(pending))
+                pending = {
+                    "doc_id": r.doc_id,
+                    "title": r.title,
+                    "president": r.president,
+                    "date": r.date,
+                    "snippet_norm": r.snippet_norm,
+                    "book": r.book,
+                    "chapter": r.chapter,
+                    "start_verse": r.verse_num,
+                    "end_verse": r.verse_num,
+                    "verse_texts": [r.verse_text],
+                    "match_proba": r.match_proba,
+                    "start_token": r.start_token,
+                    "end_token": r.end_token,
+                }
+        if pending is not None:
+            rows.append(_finalize_pending_range(pending))
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    out_df = pd.DataFrame(rows)
+    out_df.sort_values(["doc_id", "start_token", "verse_range"], inplace=True)
+    return out_df[cols]
+
+
+def _write_positive_summary(df: pd.DataFrame, out_dir: Path):
+    positives = _collapse_positive_matches(df)
+    out_path = out_dir / "matches_positive.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    positives.to_csv(out_path, index=False)
+    print(f"[ok] positive matches -> {out_path} ({len(positives)} rows)")
+
 def cmd_merge_spans(args):
     out_dir = Path(args.out_dir)
 
@@ -483,9 +635,12 @@ def cmd_merge_spans(args):
         keep["match_label"] = (keep["match_proba"] >= getattr(args, "threshold", 0.01)).astype(int)
 
         df_sorted = keep.sort_values("match_proba", ascending=False)
-        out_file = out_dir / "matches_scored.parquet"
-        write_table(df_sorted, out_file)
-        print(f"[ok] wrote final scored matches -> {out_file}")
+        if getattr(args, "write_scored", False):
+            out_file = out_dir / "matches_scored.parquet"
+            write_table(df_sorted, out_file)
+            print(f"[ok] wrote final scored matches -> {out_file}")
+
+        _write_positive_summary(df_sorted, out_dir)
 
         # optionally write the intermediate files as well
         if getattr(args, "write_intermediate", False):
@@ -541,6 +696,8 @@ def cmd_score_and_merge(args):
     out_file = out_dir / "matches_scored.parquet"
     write_table(df_sorted, out_file)
 
+    _write_positive_summary(df_sorted, out_dir)
+
     print(f"[ok] wrote final scored matches -> {out_file}")
     print("[done] score-and-merge complete.")
 
@@ -591,6 +748,7 @@ def main():
     p4.add_argument("--model_path", help="Optional path to saved BibleMatchClassifier; if provided, score merged spans and write matches_scored.parquet")
     p4.add_argument("--threshold", type=float, default=0.01, help="Decision threshold for match_label when scoring (default: 0.01)")
     p4.add_argument("--write_intermediate", action="store_true", help="If set when --model_path is provided, also write matches.parquet and matches_preview.csv in addition to matches_scored.parquet")
+    p4.add_argument("--write_scored", action="store_true", help="Write matches_scored.parquet when scoring (default: off)")
     p4.set_defaults(func=cmd_merge_spans)
 
     p5 = sub.add_parser("score-and-merge", help="Apply classifier to matches and write sorted scored file.")
