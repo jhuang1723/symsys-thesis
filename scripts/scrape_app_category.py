@@ -181,7 +181,7 @@ def main():
                     help="Skip pages with no transcript text.")
     ap.add_argument("--min-words", type=int, default=30,
                     help="When --require-transcript, also skip if transcript shorter than this.")
-    # NEW: year-range filter; defaults 1932–2024
+    # NEW: year-range filter; defaults 1932–2025
     ap.add_argument("--start-year", type=int, default=1932,
                     help="Earliest year (inclusive) to keep (default: 1932).")
     ap.add_argument("--end-year", type=int, default=2024,
