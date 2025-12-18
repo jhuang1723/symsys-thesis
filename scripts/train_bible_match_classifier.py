@@ -44,23 +44,34 @@ def load_training_data(train_csv: str) -> pd.DataFrame:
     return df[["snippet_norm", "verse_norm", "match"]]
 
 
-def combine_datasets(dfs: List[pd.DataFrame]) -> Tuple[pd.DataFrame, np.ndarray]:
+def combine_datasets(
+    dfs: List[pd.DataFrame],
+    dataset_weights: List[float] | None = None,
+) -> Tuple[pd.DataFrame, np.ndarray]:
     """
-    Concatenate datasets while assigning sample weights so that each
-    source contributes equally overall.
+    Concatenate datasets while assigning per-row sample weights so that
+    each source contributes proportionally to ``dataset_weights``.
+    If no weights are provided, treat every dataset equally.
     """
+
     if not dfs:
         raise ValueError("No training datasets provided.")
 
-    n_sources = len(dfs)
+    if dataset_weights is None:
+        dataset_weights = [1.0] * len(dfs)
+    if len(dataset_weights) != len(dfs):
+        raise ValueError("dataset_weights length must match number of datasets")
+
     frames = []
     weights = []
-    per_dataset_weight = 1.0 / n_sources
 
-    for df in dfs:
+    total = sum(dataset_weights) or 1.0
+    normalized = [w / total for w in dataset_weights]
+
+    for df, ds_wt in zip(dfs, normalized):
         frames.append(df)
-        row_weight = per_dataset_weight / max(len(df), 1)
-        weights.append(np.full(len(df), row_weight, dtype=np.float32))
+        per_row = ds_wt / max(len(df), 1)
+        weights.append(np.full(len(df), per_row, dtype=np.float32))
 
     merged = pd.concat(frames, ignore_index=True)
     sample_weights = np.concatenate(weights)
@@ -73,13 +84,27 @@ def main():
     ap.add_argument("--extra-csv", action="append", default=[], help="Additional labeled CSVs to include.")
     ap.add_argument("--model-out", required=True, help="Where to save model, e.g. models/apb_lgbm_sem.pkl")
     ap.add_argument("--sem-model-name", default="all-MiniLM-L12-v2")
+    ap.add_argument("--train-weight", type=float, default=1.0,
+                    help="Relative weight for the primary --train-csv (default: 1.0)")
+    ap.add_argument("--extra-weight", action="append", type=float,
+                    help="Relative weight(s) for each --extra-csv in the same order (default: 1.0 each)")
     args = ap.parse_args()
 
     datasets = [load_training_data(args.train_csv)]
-    for extra in args.extra_csv:
-        datasets.append(load_training_data(extra))
+    weights = [float(args.train_weight)]
 
-    df_all, sample_weights = combine_datasets(datasets)
+    extra_weights = args.extra_weight or []
+    if extra_weights and len(extra_weights) != len(args.extra_csv):
+        raise SystemExit("Provide exactly one --extra-weight per --extra-csv (or omit for default 1.0)")
+
+    for idx, extra in enumerate(args.extra_csv):
+        datasets.append(load_training_data(extra))
+        if extra_weights:
+            weights.append(float(extra_weights[idx]))
+        else:
+            weights.append(1.0)
+
+    df_all, sample_weights = combine_datasets(datasets, weights)
     print(f"[info] Combined rows: {len(df_all)}, positives: {df_all['match'].sum()}")
 
     clf = BibleMatchClassifier(sem_model_name=args.sem_model_name)

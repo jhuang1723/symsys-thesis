@@ -21,6 +21,20 @@ Options:
   --ngram-max N            ngram max for gen-candidates (default: 5)
   --top-per-doc N          how many merged hits to keep per doc for preview (default: 15)
   --tfidf-topk N           TF-IDF candidates to keep per window (default: 25)
+  --out-dir PATH           Override default results dir (default: results/app/<category>)
+  --keyword-candidates     Explicitly enable keyword-based candidate generation (default: on)
+  --no-keyword-candidates  Disable keyword-based candidates
+  --keyword-max-total N    Limit keyword candidates per window (forwarded to gen-candidates)
+  --keyword-max-per-keyword N
+                           Limit keyword matches per keyword per window
+  --keyword-score FLOAT    Override score assigned to keyword candidates
+  --llm-model-id ID        Bedrock model id for the final vetting step (default: env BEDROCK_MODEL_ID or Claude 3 Sonnet)
+  --llm-chunk-size N       Rows per LLM request (default: 3)
+  --llm-limit N            Optional limit for LLM review (debugging)
+  --llm-save-intermediate  Persist the full TRUE/FALSE/MAYBE CSV in addition to TRUE/MAYBE splits
+  --llm-output-dir PATH    Where to store TRUE/MAYBE CSVs (default: results/categories)
+  --llm-debug              Print prompts/responses when LLM JSON parsing fails
+  --skip-llm               Skip the Bedrock verification step
   --help                   Show this message
 
 Example:
@@ -41,13 +55,24 @@ BIBLE_INDEX="results/verses_index.parquet"
 OUT_DIR="results/app/${CATEGORY}"
 SPEECHES_IN="cleaned_data/app/${CATEGORY}/rows_norm.parquet"
 MODEL_PATH="models/apb_lgbm_sem.pkl"
-THRESHOLD=0.005
+THRESHOLD=0.1
 NGRAM_MIN=3
 NGRAM_MAX=5
 TOP_PER_DOC=15
 CAND_TOPK=25
 WRITE_INTERMEDIATE=false
 WRITE_SCORED=false
+KEYWORD_CAND=true
+KEYWORD_MAX_TOTAL=""
+KEYWORD_MAX_PER=""
+KEYWORD_SCORE=""
+LLM_MODEL_ID="${BEDROCK_MODEL_ID:-anthropic.claude-3-sonnet-20240229-v1:0}"
+LLM_CHUNK_SIZE=3
+LLM_LIMIT=""
+LLM_SAVE_INTERMEDIATE=false
+LLM_OUTPUT_DIR="results/categories"
+LLM_DEBUG=false
+SKIP_LLM=false
 
 # parse optional args
 while [[ $# -gt 0 ]]; do
@@ -76,6 +101,32 @@ while [[ $# -gt 0 ]]; do
       TOP_PER_DOC="$2"; shift 2;;
     --tfidf-topk)
       CAND_TOPK="$2"; shift 2;;
+    --out-dir)
+      OUT_DIR="$2"; shift 2;;
+    --keyword-candidates)
+      KEYWORD_CAND=true; shift;;
+    --no-keyword-candidates)
+      KEYWORD_CAND=false; shift;;
+    --keyword-max-total)
+      KEYWORD_MAX_TOTAL="$2"; shift 2;;
+    --keyword-max-per-keyword)
+      KEYWORD_MAX_PER="$2"; shift 2;;
+    --keyword-score)
+      KEYWORD_SCORE="$2"; shift 2;;
+    --llm-model-id)
+      LLM_MODEL_ID="$2"; shift 2;;
+    --llm-chunk-size)
+      LLM_CHUNK_SIZE="$2"; shift 2;;
+    --llm-limit)
+      LLM_LIMIT="$2"; shift 2;;
+    --llm-save-intermediate)
+      LLM_SAVE_INTERMEDIATE=true; shift;;
+    --llm-output-dir)
+      LLM_OUTPUT_DIR="$2"; shift 2;;
+    --llm-debug)
+      LLM_DEBUG=true; shift;;
+    --skip-llm)
+      SKIP_LLM=true; shift;;
     --help)
       usage;;
     *)
@@ -172,19 +223,36 @@ PY
     fi
   fi
 
-  echo "[info] 2/4 Indexing speeches -> $OUT_DIR/speeches_index.parquet + windows (input: $SPEECHES_IN)"
+  echo "[info] 2/5 Indexing speeches -> $OUT_DIR/speeches_index.parquet + windows (input: $SPEECHES_IN)"
   python3 scripts/verse_match_pipeline_app.py index-speeches \
     --speeches_in "$SPEECHES_IN" --out_dir "$OUT_DIR" --window_len 30 --stride 5
 fi
 
-echo "[info] 3/4 Generating TF-IDF candidates -> $OUT_DIR/candidates.parquet"
-python3 scripts/verse_match_pipeline_app.py gen-candidates \
-  --bible_index "$BIBLE_INDEX" \
-  --windows "$OUT_DIR/windows.parquet" \
-  --out_dir "$OUT_DIR" --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --topk $CAND_TOPK --batch_size 1000
+echo "[info] 3/5 Generating TF-IDF + keyword candidates -> $OUT_DIR/candidates.parquet"
+GEN_CMD=(python3 scripts/verse_match_pipeline_app.py gen-candidates
+  --bible_index "$BIBLE_INDEX"
+  --windows "$OUT_DIR/windows.parquet"
+  --out_dir "$OUT_DIR"
+  --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX
+  --topk $CAND_TOPK --batch_size 1000)
+
+if [ "$KEYWORD_CAND" = true ]; then
+  GEN_CMD+=(--keyword-candidates)
+  if [ -n "$KEYWORD_MAX_TOTAL" ]; then
+    GEN_CMD+=(--keyword-max-total "$KEYWORD_MAX_TOTAL")
+  fi
+  if [ -n "$KEYWORD_MAX_PER" ]; then
+    GEN_CMD+=(--keyword-max-per-keyword "$KEYWORD_MAX_PER")
+  fi
+  if [ -n "$KEYWORD_SCORE" ]; then
+    GEN_CMD+=(--keyword-score "$KEYWORD_SCORE")
+  fi
+fi
+
+"${GEN_CMD[@]}"
 
 # Merge spans and (optionally) score in one step
-echo "[info] 4/4 Merging spans and scoring -> matches_scored.parquet"
+echo "[info] 4/5 Merging spans and scoring -> matches_scored.parquet"
 CMD=(python3 scripts/verse_match_pipeline_app.py merge-spans --out_dir "$OUT_DIR" \
   --ngram_min $NGRAM_MIN --ngram_max $NGRAM_MAX --min_cov 0.45 --min_lcs 0.40 --max_gap 8 --top_per_doc $TOP_PER_DOC \
   --bible_index "$BIBLE_INDEX" \
@@ -202,7 +270,37 @@ fi
 echo "[debug] running: ${CMD[*]}"
 "${CMD[@]}"
 
-echo "[done] pipeline complete. Positive matches at: $OUT_DIR/matches_positive.csv"
+if [ "$SKIP_LLM" = true ]; then
+  echo "[info] Skipping LLM verification (--skip-llm)."
+  TRUE_PATH="(not generated; --skip-llm set)"
+  MAYBE_PATH="(not generated; --skip-llm set)"
+else
+  echo "[info] 5/5 Verifying matches with LLM -> $LLM_OUTPUT_DIR"
+  LLM_CMD=(python3 scripts/llm_verify_matches.py \
+    --input "$OUT_DIR/matches_positive.csv" \
+    --category "$CATEGORY" \
+    --output-dir "$LLM_OUTPUT_DIR" \
+    --model-id "$LLM_MODEL_ID" \
+    --chunk-size "$LLM_CHUNK_SIZE")
+  if [ -n "$LLM_LIMIT" ]; then
+    LLM_CMD+=(--limit "$LLM_LIMIT")
+  fi
+  if [ "$LLM_SAVE_INTERMEDIATE" = true ]; then
+    LLM_CMD+=(--save-intermediate)
+  fi
+  if [ "$LLM_DEBUG" = true ]; then
+    LLM_CMD+=(--debug-llm)
+  fi
+  echo "[debug] running: ${LLM_CMD[*]}"
+  "${LLM_CMD[@]}"
+  TRUE_PATH="$LLM_OUTPUT_DIR/${CATEGORY}_llm_true.csv"
+  MAYBE_PATH="$LLM_OUTPUT_DIR/${CATEGORY}_llm_maybe.csv"
+fi
+
+echo "[done] pipeline complete."
+echo "[info] TRUE matches -> $TRUE_PATH"
+echo "[info] MAYBE matches -> $MAYBE_PATH"
+echo "[info] Classifier positives -> $OUT_DIR/matches_positive.csv"
 if [ "$WRITE_SCORED" = true ]; then
   echo "[info] Full scored matches at: $OUT_DIR/matches_scored.parquet"
 fi

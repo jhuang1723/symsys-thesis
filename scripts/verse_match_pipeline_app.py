@@ -85,6 +85,117 @@ def normalize_text(s: str) -> str:
 
 
 # -------------------------
+# Keyword inventory
+# -------------------------
+
+_RAW_KEYWORDS = [
+    "scripture", "scriptures", "bible", "biblical",
+    "jesus", "christ", "messiah", "lord", "god", "holy", "holy ghost", "holy spirit",
+    "spirit", "heaven", "heavens", "hell", "cross", "resurrection",
+    "solomon", "moses", "abraham", "isaac", "jacob", "rachel", "sarah",
+    "ruth", "naomi", "esther", "mary", "martha", "bethlehem", "galilee",
+    "paul", "peter", "timothy", "lazarus", "elijah", "elisha", "jonah",
+    "isaiah", "jeremiah", "ezekiel", "daniel", "hosea", "micah",
+    "prophet", "prophecy", "psalmist",
+    "faith", "love", "grace", "hope", "mercy", "redemption",
+    "ark", "covenant", "commandments", "testament", "gospel", "apostle",
+    "savior", "redeemer", "kingdom", "zion"
+]
+
+_RAW_BIBLE_BOOKS = [
+    "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy",
+    "Joshua", "Judges", "Ruth", "1 Samuel", "2 Samuel",
+    "1 Kings", "2 Kings", "1 Chronicles", "2 Chronicles",
+    "Ezra", "Nehemiah", "Esther", "Job", "Psalms",
+    "Proverbs", "Ecclesiastes", "Song of Solomon",
+    "Isaiah", "Jeremiah", "Lamentations", "Ezekiel", "Daniel",
+    "Hosea", "Joel", "Amos", "Obadiah", "Jonah",
+    "Micah", "Nahum", "Habakkuk", "Zephaniah", "Haggai",
+    "Zechariah", "Malachi", "Matthew", "Mark", "Luke", "John",
+    "Acts", "Romans", "1 Corinthians", "2 Corinthians",
+    "Galatians", "Ephesians", "Philippians", "Colossians",
+    "1 Thessalonians", "2 Thessalonians", "1 Timothy", "2 Timothy",
+    "Titus", "Philemon", "Hebrews", "James", "1 Peter", "2 Peter",
+    "1 John", "2 John", "3 John", "Jude", "Revelation"
+]
+
+_ORDINAL_WORDS = {"1": "first", "2": "second", "3": "third"}
+
+def _normalize_keywords(raw_list):
+    out = []
+    for item in raw_list:
+        norm = normalize_text(item)
+        if norm:
+            out.append(norm)
+    return out
+
+def _build_book_aliases():
+    aliases = {}
+    for name in _RAW_BIBLE_BOOKS:
+        canon = normalize_text(name)
+        if not canon:
+            continue
+        aliases[canon] = canon
+        tokens = canon.split()
+        if tokens and tokens[0] in _ORDINAL_WORDS:
+            rest = " ".join(tokens[1:])
+            aliases[f"{_ORDINAL_WORDS[tokens[0]]} {rest}"] = canon
+        aliases[f"book of {canon}"] = canon
+        if canon in {"matthew", "mark", "luke", "john"}:
+            aliases[f"gospel of {canon}"] = canon
+    # manual extras
+    aliases["psalm"] = normalize_text("Psalms")
+    aliases["psalms"] = normalize_text("Psalms")
+    aliases["song of songs"] = normalize_text("Song of Solomon")
+    aliases["canticles"] = normalize_text("Song of Solomon")
+    aliases["revelations"] = normalize_text("Revelation")
+    aliases["apocalypse"] = normalize_text("Revelation")
+    return aliases
+
+_BASE_KEYWORDS = sorted(set(_normalize_keywords(_RAW_KEYWORDS)))
+_BOOK_ALIAS_MAP = _build_book_aliases()
+_BOOK_KEYWORDS = set(_BOOK_ALIAS_MAP.keys())
+
+_BASE_SINGLE_KEYWORDS = {kw for kw in _BASE_KEYWORDS if " " not in kw}
+_BASE_PHRASE_KEYWORDS = {kw for kw in _BASE_KEYWORDS if " " in kw}
+_BOOK_SINGLE_KEYWORDS = {kw for kw in _BOOK_KEYWORDS if " " not in kw}
+_BOOK_PHRASE_KEYWORDS = {kw for kw in _BOOK_KEYWORDS if " " in kw}
+
+_ALL_KEYWORD_SINGLES = _BASE_SINGLE_KEYWORDS | _BOOK_SINGLE_KEYWORDS
+_ALL_KEYWORD_PHRASES = _BASE_PHRASE_KEYWORDS | _BOOK_PHRASE_KEYWORDS
+
+def _keywords_in_text(text: str, single_set, phrase_set):
+    tokens = set(text.split())
+    hits = list(tokens & single_set)
+    if phrase_set:
+        padded = f" {text} "
+        hits.extend([kw for kw in phrase_set if f" {kw} " in padded])
+    return hits
+
+def _select_evenly(seq: List[str], limit: int) -> List[str]:
+    if limit <= 0:
+        return []
+    if len(seq) <= limit:
+        return list(seq)
+    if limit == 1:
+        return [seq[0]]
+    idx = np.linspace(0, len(seq) - 1, num=limit, dtype=int)
+    seen = set()
+    out = []
+    for i in idx:
+        if int(i) not in seen:
+            out.append(seq[int(i)])
+            seen.add(int(i))
+    if len(out) < limit:
+        for i in range(len(seq)):
+            if i not in seen:
+                out.append(seq[i])
+                if len(out) == limit:
+                    break
+    return out
+
+
+# -------------------------
 # IDs
 # -------------------------
 
@@ -253,6 +364,79 @@ def cmd_index_speeches(args):
 # 3) Candidate generation (TF-IDF 3–5 grams, TOP-K=10 default)
 # -------------------------
 
+def _build_keyword_candidate_index(verses: pd.DataFrame):
+    kw_to_verses = {}
+    kw_kind = {}
+
+    # lexical keywords from verse text
+    for row in verses.itertuples(index=False):
+        hits = _keywords_in_text(row.text_norm, _BASE_SINGLE_KEYWORDS, _BASE_PHRASE_KEYWORDS)
+        if not hits:
+            continue
+        for kw in hits:
+            kw_to_verses.setdefault(kw, []).append(row.verse_id)
+            kw_kind[kw] = "term"
+
+    # book-level keywords (map alias -> canonical book -> verses)
+    if "book" in verses.columns:
+        book_norm = verses["book"].astype(str).map(normalize_text)
+        book_map = {}
+        for verse_id, bk in zip(verses["verse_id"], book_norm):
+            book_map.setdefault(bk, []).append(verse_id)
+        for alias, canonical in _BOOK_ALIAS_MAP.items():
+            verse_ids = book_map.get(canonical)
+            if verse_ids:
+                kw_to_verses[alias] = verse_ids
+                kw_kind[alias] = "book"
+    return kw_to_verses, kw_kind
+
+def _keyword_candidate_rows(verses: pd.DataFrame,
+                            windows: pd.DataFrame,
+                            max_per_keyword: int,
+                            max_total: int,
+                            keyword_score: float):
+    kw_to_verses, kw_kind = _build_keyword_candidate_index(verses)
+    if not kw_to_verses:
+        return []
+
+    verse_ref = dict(zip(verses["verse_id"], verses["ref"]))
+    kw_freq = {kw: len(vs) for kw, vs in kw_to_verses.items()}
+
+    rows = []
+    seen = set()
+    for row in windows.itertuples(index=False):
+        hits = _keywords_in_text(row.snippet_norm, _ALL_KEYWORD_SINGLES, _ALL_KEYWORD_PHRASES)
+        if not hits:
+            continue
+        uniq_hits = sorted(set(hits), key=lambda kw: (kw_freq.get(kw, 1e9), kw))
+        added = 0
+        for kw in uniq_hits:
+            if added >= max_total:
+                break
+            verse_ids = kw_to_verses.get(kw)
+            if not verse_ids:
+                continue
+            portion = _select_evenly(verse_ids, min(max_per_keyword, len(verse_ids)))
+            for vid in portion:
+                key = (row.window_id, vid)
+                if key in seen:
+                    continue
+                rows.append({
+                    "window_id": row.window_id,
+                    "verse_id": vid,
+                    "ref": verse_ref.get(vid, ""),
+                    "score": float(keyword_score),
+                    "rank": 0,
+                    "source": "keyword",
+                    "keyword": kw,
+                    "keyword_kind": kw_kind.get(kw, "term")
+                })
+                seen.add(key)
+                added += 1
+                if added >= max_total:
+                    break
+    return rows
+
 def cmd_gen_candidates(args):
     if not _HAVE_SK:
         raise RuntimeError("scikit-learn not available. Install scikit-learn to run gen-candidates.")
@@ -321,9 +505,39 @@ def cmd_gen_candidates(args):
         if (start // chunk) % 10 == 0:
             print(f"  processed windows {start}..{end} / {W.shape[0]}")
 
+    tfidf_count = len(out_rows)
     cand = pd.DataFrame(out_rows)
-    cand.sort_values(["window_id","rank"], inplace=True)
+    if cand.empty:
+        cand = pd.DataFrame(columns=["window_id","verse_id","ref","score","rank","source"])
+    cand["source"] = "tfidf"
+
+    keyword_rows = []
+    if getattr(args, "keyword_candidates", False):
+        keyword_rows = _keyword_candidate_rows(
+            verses,
+            windows,
+            max_per_keyword=args.keyword_max_per_keyword,
+            max_total=args.keyword_max_total,
+            keyword_score=args.keyword_score
+        )
+        if keyword_rows:
+            extra = pd.DataFrame(keyword_rows)
+            cand = pd.concat([cand, extra], ignore_index=True)
+
+    if not cand.empty:
+        cand["source_priority"] = cand["source"].map({"tfidf": 0}).fillna(1)
+        cand.sort_values(["window_id", "source_priority", "score"], ascending=[True, True, False], inplace=True)
+        cand = cand.drop_duplicates(subset=["window_id","verse_id"], keep="first")
+        cand["rank"] = cand.groupby("window_id").cumcount() + 1
+        cand.drop(columns=["source_priority"], inplace=True)
+    else:
+        cand = pd.DataFrame(columns=["window_id","verse_id","ref","score","rank","source"])
+
     write_table(cand, Path(args.out_dir) / "candidates.parquet")
+    print(
+        "[stats] candidate rows: TF-IDF="
+        f"{tfidf_count} keyword={len(keyword_rows)} final={len(cand)}"
+    )
     print(f"[ok] candidates -> {Path(args.out_dir)/'candidates.parquet'}  ({len(cand)} rows)")
 
 
@@ -608,6 +822,7 @@ def cmd_merge_spans(args):
     keep["rank_in_doc"] = keep.groupby("doc_id")["score_max"].rank(method="first", ascending=False)
     keep_top = keep[keep["rank_in_doc"] <= args.top_per_doc] \
         .sort_values(["doc_id","score_max"], ascending=[True, False])
+    print(f"[stats] merged spans retained pre-classifier: {len(keep)} (top_per_doc preview rows: {len(keep_top)})")
 
     # If a model_path was provided, optionally score and write matches_scored.parquet
     if getattr(args, "model_path", None):
@@ -633,6 +848,8 @@ def cmd_merge_spans(args):
         print("[info] applying classifier to merged spans...")
         keep["match_proba"] = clf.predict_proba(keep["snippet_norm"], keep["verse_norm"])
         keep["match_label"] = (keep["match_proba"] >= getattr(args, "threshold", 0.01)).astype(int)
+        pos = int(keep["match_label"].sum())
+        print(f"[stats] classifier positives >= {args.threshold}: {pos} / {len(keep)}")
 
         df_sorted = keep.sort_values("match_proba", ascending=False)
         if getattr(args, "write_scored", False):
@@ -689,6 +906,8 @@ def cmd_score_and_merge(args):
     print("[info] applying classifier...")
     df["match_proba"] = clf.predict_proba(df["snippet_norm"], df["verse_norm"])
     df["match_label"] = (df["match_proba"] >= args.threshold).astype(int)
+    pos = int(df["match_label"].sum())
+    print(f"[stats] classifier positives >= {args.threshold}: {pos} / {len(df)}")
 
     print("[info] sorting by probability...")
     df_sorted = df.sort_values("match_proba", ascending=False)
@@ -731,6 +950,14 @@ def main():
     p3.add_argument("--ngram_max", type=int, default=5)
     p3.add_argument("--topk", type=int, default=10)          # <-- K=10 default
     p3.add_argument("--batch_size", type=int, default=1000, help="windows per batch")
+    p3.add_argument("--keyword-candidates", action="store_true",
+                    help="Add keyword-based candidate pairs in addition to TF-IDF matches")
+    p3.add_argument("--keyword-max-per-keyword", type=int, default=25,
+                    help="Max verses to add per keyword per window (default: 25)")
+    p3.add_argument("--keyword-max-total", type=int, default=50,
+                    help="Max keyword-based candidates to retain per window (default: 50)")
+    p3.add_argument("--keyword-score", type=float, default=0.35,
+                    help="Score to assign to keyword-based candidates (default: 0.35)")
     p3.set_defaults(func=cmd_gen_candidates)
 
     p4 = sub.add_parser("merge-spans", help="Merge overlapping windows per verse, add features, filter, export")

@@ -82,6 +82,17 @@ def append_label(out_path: Path, fieldnames: list[str], row: dict):
         writer.writerow(row)
 
 
+def append_match(out_path: Path, fieldnames: list[str], row: dict):
+    if out_path is None:
+        return
+    new_file = not out_path.exists()
+    with out_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if new_file:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def format_block(title: str, text: str) -> str:
     wrapped = WRAP.fill(text.strip()) if isinstance(text, str) else ""
     return f"{title}:\n{wrapped}\n"
@@ -115,18 +126,45 @@ def main():
         help="Where to append reviewer labels.",
     )
     ap.add_argument(
+        "--approved-out",
+        default=None,
+        help="Optional CSV to receive rows marked 'yes'.",
+    )
+    ap.add_argument(
+        "--rejected-out",
+        default=None,
+        help="Optional CSV to receive rows marked 'no'.",
+    )
+    ap.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Max rows to review this session (default: all remaining).",
     )
+    ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore any prior labels and review from start (truncates --out/approved/rejected).",
+    )
     args = ap.parse_args()
 
     matches = load_matches(Path(args.input))
     out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    approved_path = Path(args.approved_out) if args.approved_out else None
+    rejected_path = Path(args.rejected_out) if args.rejected_out else None
 
-    existing = load_existing_labels(out_path)
+    if args.fresh:
+        for path in filter(None, [out_path, approved_path, rejected_path]):
+            if path.exists():
+                path.unlink()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if approved_path:
+        approved_path.parent.mkdir(parents=True, exist_ok=True)
+    if rejected_path:
+        rejected_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = set() if args.fresh else load_existing_labels(out_path)
     print(f"[info] Loaded {len(matches)} rows ({len(existing)} already labeled).")
 
     fieldnames = [
@@ -141,6 +179,8 @@ def main():
         "match_proba",
         "label",
     ]
+
+    match_cols = matches.columns.tolist()
 
     reviewed = 0
     for row in matches.itertuples(index=False):
@@ -169,6 +209,10 @@ def main():
             "label": label,
         }
         append_label(out_path, fieldnames, record)
+        if label == 1:
+            append_match(approved_path, match_cols, row_dict)
+        else:
+            append_match(rejected_path, match_cols, row_dict)
         existing.add(key_str)
         reviewed += 1
         if args.limit and reviewed >= args.limit:
