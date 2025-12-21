@@ -18,7 +18,7 @@ PROMPT_TEMPLATE = """You verify whether excerpts from presidential eulogies actu
 Compare the `snippet_norm` text to the `verse_text` and assess whether the speaker is clearly invoking that particular Bible verse.
 
 Judgement categories (choose exactly one):
-- TRUE: the snippet clearly paraphrases or directly references the verse (it is not enough to express merely a similar idea, but the exact verse must be clearly intended).
+- TRUE: the snippet directly references the verse (it is not enough to express merely a similar idea, but the exact verse must be clearly intended).
 - FALSE: no meaningful connection to the verse.
 - MAYBE: tenuous link or insufficient information to decide.
 - Always mark MAYBE when the snippet sounds biblical but appears to cite a different passage than the provided verse or when you cannot confirm an exact correspondence.

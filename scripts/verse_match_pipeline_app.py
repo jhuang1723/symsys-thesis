@@ -806,15 +806,22 @@ def cmd_merge_spans(args):
         if not pth.exists():
             raise FileNotFoundError(f"Missing input at {pth}")
 
+    print("[info] loading + joining candidates/windows/verses/speeches ...")
     df = _join_all_for_merge(cand_path, wins_path, vers_path, docs_path)
+    print(f"[stats] joined rows: {len(df)}")
 
+    print("[info] merging overlapping windows into spans ...")
     spans = _merge_overlaps(df[["doc_id","verse_id","start_token","end_token","score"]], max_gap=args.max_gap)
+    print(f"[stats] merged spans: {len(spans)}")
 
     docs = _read_infer(docs_path)[["doc_id","title","president","date","text_norm"]].rename(columns={"text_norm":"doc_norm"})
     vers = _read_infer(vers_path)[["verse_id","ref","text_raw","text_norm"]].rename(columns={"text_raw":"verse_text","text_norm":"verse_norm"})
+    print("[info] computing text features (ngram coverage, lcs) ...")
     merged = _add_text_and_features(spans, docs, vers, args.ngram_min, args.ngram_max)
+    print(f"[stats] feature rows: {len(merged)}")
 
     keep = merged[(merged["cov_ngram"] >= args.min_cov) | (merged["lcs_ratio"] >= args.min_lcs)]
+    print(f"[stats] retained after filters: {len(keep)}")
 
     keep = keep.sort_values(["doc_id","verse_id","score_max"], ascending=[True, True, False]) \
                .drop_duplicates(subset=["doc_id","verse_id"], keep="first")
