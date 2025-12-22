@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="results/categories",
+        default="results/spoken-addresses-and-remarks_full",
         help="Directory for TRUE/MAYBE CSV outputs.",
     )
     parser.add_argument(
@@ -109,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, print prompts/responses when parsing fails to aid debugging.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing intermediate CSV, skipping already-verified rows.",
+    )
     return parser.parse_args()
 
 
@@ -122,9 +127,38 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.resume:
+        args.save_intermediate = True
+
     client = build_client()
     verdict_rows: List[Dict[str, str]] = []
-    for chunk in chunked(rows, args.chunk_size):
+    intermediate_path = None
+    if args.save_intermediate:
+        fname = (
+            args.intermediate_name
+            if args.intermediate_name
+            else f"{args.category}_llm_all.csv"
+        )
+        intermediate_path = output_dir / fname
+
+    processed_ids = set()
+    if args.resume and intermediate_path and intermediate_path.exists():
+        verdict_rows = read_verdict_rows(intermediate_path)
+        processed_ids = {row.get("row_index", "") for row in verdict_rows}
+        print(
+            f"[info] Resuming from {intermediate_path}, "
+            f"loaded {len(processed_ids)} verified rows."
+        )
+
+    remaining = [row for row in rows if row["row_index"] not in processed_ids]
+    total_chunks = (len(remaining) + args.chunk_size - 1) // args.chunk_size
+    print(
+        f"[info] Loaded {len(rows)} rows; remaining {len(remaining)} rows "
+        f"({total_chunks} chunks of {args.chunk_size})."
+    )
+
+    for idx, chunk in enumerate(chunked(remaining, args.chunk_size), start=1):
+        print(f"[info] Processing chunk {idx}/{total_chunks}...")
         verdicts = request_chunk_with_retries(
             client=client,
             model_id=args.model_id,
@@ -133,6 +167,7 @@ def main() -> None:
             debug=args.debug_llm,
         )
         rows_by_id = {row["row_index"]: row for row in chunk}
+        new_rows: List[Dict[str, str]] = []
         for verdict in verdicts:
             combined = {
                 **select_fields(rows_by_id[verdict["row_index"]]),
@@ -141,6 +176,13 @@ def main() -> None:
                 "confidence": str(verdict.get("confidence", "")),
             }
             verdict_rows.append(combined)
+            new_rows.append(combined)
+
+        if intermediate_path:
+            append_rows(intermediate_path, new_rows)
+            print(
+                f"[info] Wrote {len(new_rows)} rows to {intermediate_path}."
+            )
 
     true_rows = [row for row in verdict_rows if row["judgement"] == "TRUE"]
     maybe_rows = [row for row in verdict_rows if row["judgement"] == "MAYBE"]
@@ -152,15 +194,8 @@ def main() -> None:
     print(f"[ok] TRUE rows -> {true_path} ({len(true_rows)})")
     print(f"[ok] MAYBE rows -> {maybe_path} ({len(maybe_rows)})")
 
-    if args.save_intermediate:
-        fname = (
-            args.intermediate_name
-            if args.intermediate_name
-            else f"{args.category}_llm_all.csv"
-        )
-        all_path = output_dir / fname
-        write_rows(all_path, verdict_rows)
-        print(f"[info] Saved all verdicts -> {all_path} ({len(verdict_rows)})")
+    if args.save_intermediate and intermediate_path:
+        print(f"[info] Intermediate file -> {intermediate_path} ({len(verdict_rows)})")
 
 
 def read_rows(path: str, limit: int | None) -> Iterator[Dict[str, str]]:
@@ -364,6 +399,28 @@ def write_rows(path: Path, rows: List[Dict[str, str]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def append_rows(path: Path, rows: List[Dict[str, str]]) -> None:
+    if not rows:
+        return
+    fieldnames = SELECTED_FIELDS + ["judgement", "reason", "confidence"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def read_verdict_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        return [row for row in reader]
 
 
 if __name__ == "__main__":
