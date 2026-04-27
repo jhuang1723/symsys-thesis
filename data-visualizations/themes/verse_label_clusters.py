@@ -3,6 +3,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -12,7 +13,6 @@ LABELS = {
     1: "Peace & Reconciliation",
     2: "Love & Moral Obligation",
     3: "Hope & Promise",
-    4: "Sacrifice & Service",
     5: "Justice & Righteousness",
     6: "Divine Authority & Sovereignty",
     7: "Joy & Praise",
@@ -23,6 +23,9 @@ LABELS = {
 def main() -> None:
     csv_path = Path(__file__).with_name("verse_labels_auto_unique_all.csv")
     df = pd.read_csv(csv_path)
+
+    sns.set_theme(style="whitegrid", context="paper", font="serif", font_scale=1.15)
+    plt.rcParams["font.serif"] = ["Times New Roman", "Times", "DejaVu Serif"]
 
     texts = df["verse_text"].fillna("").astype(str)
     counts = df["occurrence_count"].fillna(1).astype(int).clip(lower=1)
@@ -96,8 +99,7 @@ def main() -> None:
                 x_c_sup,
                 y_c_sup,
                 LABELS[label_id],
-                fontsize=8,
-                weight="bold",
+                fontsize=9,
                 ha="center",
                 va="center",
                 bbox={"boxstyle": "round,pad=0.2", "fc": "white", "alpha": 0.7},

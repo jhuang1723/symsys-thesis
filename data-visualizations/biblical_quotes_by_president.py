@@ -44,6 +44,23 @@ PRESIDENT_PARTY = {
     "Donald J. Trump (1st Term)": "Republican",
     "Joseph R. Biden, Jr.": "Democratic",
 }
+PRESIDENT_LABELS = {
+    "Franklin D. Roosevelt": "FDR",
+    "Harry S Truman": "Truman",
+    "Dwight D. Eisenhower": "Eisenhower",
+    "John F. Kennedy": "JFK",
+    "Lyndon B. Johnson": "LBJ",
+    "Richard Nixon": "Nixon",
+    "Gerald R. Ford": "Ford",
+    "Jimmy Carter": "Carter",
+    "Ronald Reagan": "Reagan",
+    "George Bush": "H.W. Bush",
+    "William J. Clinton": "Clinton",
+    "George W. Bush": "W. Bush",
+    "Barack Obama": "Obama",
+    "Donald J. Trump (1st Term)": "Trump",
+    "Joseph R. Biden, Jr.": "Biden",
+}
 PARTY_COLORS = {
     "Democratic": "#1f77b4",
     "Republican": "#d62728",
@@ -67,6 +84,13 @@ def build_chart(
     y_label: str,
     title: str,
 ) -> None:
+    plot_df = df.copy()
+    plot_df["president_label"] = plot_df["president"].map(PRESIDENT_LABELS)
+    if plot_df["president_label"].isna().any():
+        missing = plot_df[plot_df["president_label"].isna()]["president"].tolist()
+        raise ValueError(f"Missing display labels for presidents: {missing}")
+    president_label_order = [PRESIDENT_LABELS[president] for president in PRESIDENT_ORDER]
+
     sns.set_theme(
         style="whitegrid",
         context="paper",
@@ -77,12 +101,12 @@ def build_chart(
     fig, ax = plt.subplots(figsize=(9.5, 4.4), dpi=300)
 
     sns.barplot(
-        data=df,
-        x="president",
+        data=plot_df,
+        x="president_label",
         y=y_col,
         hue="party",
         palette=PARTY_COLORS,
-        order=PRESIDENT_ORDER,
+        order=president_label_order,
         dodge=False,
         ax=ax,
     )
