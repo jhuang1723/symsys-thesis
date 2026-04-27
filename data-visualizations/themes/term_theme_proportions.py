@@ -46,6 +46,23 @@ PRESIDENT_ORDER = [
     "Donald J. Trump (1st Term)",
     "Joseph R. Biden, Jr.",
 ]
+PRESIDENT_LABELS = {
+    "Franklin D. Roosevelt": "FDR",
+    "Harry S Truman": "Truman",
+    "Dwight D. Eisenhower": "Eisenhower",
+    "John F. Kennedy": "JFK",
+    "Lyndon B. Johnson": "LBJ",
+    "Richard Nixon": "Nixon",
+    "Gerald R. Ford": "Ford",
+    "Jimmy Carter": "Carter",
+    "Ronald Reagan": "Reagan",
+    "George Bush": "H.W. Bush",
+    "William J. Clinton": "Clinton",
+    "George W. Bush": "W. Bush",
+    "Barack Obama": "Obama",
+    "Donald J. Trump (1st Term)": "Trump",
+    "Joseph R. Biden, Jr.": "Biden",
+}
 
 
 def _load_csv(path: Path) -> pd.DataFrame:
@@ -68,6 +85,7 @@ def build_chart(df: pd.DataFrame, output_path: Path) -> None:
     )
     plt.rcParams["font.serif"] = ["Times New Roman", "Times", "DejaVu Serif"]
     fig, ax = plt.subplots(figsize=(11, 5), dpi=300)
+    president_labels = [PRESIDENT_LABELS[president] for president in df.index]
 
     palette = sns.color_palette("muted", n_colors=len(LABEL_ORDER))
     label_colors = dict(zip(LABEL_ORDER, palette))
@@ -89,6 +107,8 @@ def build_chart(df: pd.DataFrame, output_path: Path) -> None:
     ax.xaxis.set_label_coords(0.1, -0.36)
     ax.set_ylabel("Share of verse quotes", fontsize=12)
     ax.set_title("Theme Proportions by Presidential Term", fontsize=14)
+    ax.set_xticks(range(len(df.index)))
+    ax.set_xticklabels(president_labels)
     ax.tick_params(axis="x", rotation=30, labelsize=9)
     ax.tick_params(axis="y", labelsize=10)
     ax.set_ylim(0, 1.0)
